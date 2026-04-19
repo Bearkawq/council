@@ -86,6 +86,93 @@ class CouncilEngine:
         )
         return session
 
+    def _execute_seat_runtime(
+        self, session: Session, node: Node, seat_name: str, profile: SeatProfile
+    ) -> Optional[SeatAction]:
+        """Execute seat using runtime (local_llm or hybrid), return action."""
+        if not self.runtime or self.runtime_mode == "simulation":
+            return None
+
+        context = f"Node: {node.title}\nSummary: {node.summary[:200]}"
+        from seats.runtime import build_normal_round_prompt
+
+        system_prompt = build_normal_round_prompt(
+            seat_name, profile, node.title, node.summary[:150]
+        )
+        resp = self.runtime.execute_seat(seat_name, context, system_prompt)
+
+        status = "error" if resp.error else "success"
+        session.add_event(
+            "seat_response",
+            f"[{seat_name}] {resp.stance}: {resp.summary[:80]} | {resp.model_used} {resp.latency_ms}ms [{status}]",
+            seat=seat_name,
+            node_id=node.node_id,
+        )
+
+        if resp.fallback_used:
+            session.add_event(
+                "fallback",
+                f"{seat_name} fell back: {resp.fallback_reason or 'sim fallback'}",
+                seat=seat_name,
+            )
+
+        if resp.error or resp.parse_failed or resp.empty_output:
+            if self.runtime_mode == "hybrid" and self.runtime:
+                try:
+                    sim_resp = self.runtime._simulation_response(seat_name, context)
+                    sim_resp.fallback_reason = resp.error or "parse_failed"
+                    sim_resp.fallback_used = True
+                    resp = sim_resp
+                except:
+                    return None
+            else:
+                return None
+
+        return self._convert_runtime_response(seat_name, node, resp)
+
+    def _convert_runtime_response(
+        self, seat_name: str, node: Node, resp
+    ) -> Optional[SeatAction]:
+        """Convert SeatResponse to SeatAction."""
+        if not resp or not resp.stance:
+            return None
+
+        action_type = "support"
+        title = f"[{seat_name}] {resp.summary[:50]}"
+
+        if resp.stance == "object":
+            action_type = "object"
+        elif resp.stance == "abstain":
+            return None
+
+        if resp.proposed_actions:
+            first_action = resp.proposed_actions[0]
+            action_type = first_action.get("action_type", action_type)
+            title = first_action.get("title", title)[:80]
+            summary = first_action.get("summary", resp.summary)[:120]
+            # Map to valid action types
+            valid = {
+                "support",
+                "object",
+                "claim",
+                "alternative",
+                "refinement",
+                "evidence_needed",
+            }
+            if action_type not in valid:
+                action_type = "support"
+        else:
+            summary = resp.summary[:120]
+
+        return SeatAction(
+            seat=seat_name,
+            node_id=node.node_id,
+            action_type=action_type,
+            title=title,
+            summary=summary,
+            confidence=resp.confidence,
+        )
+
     def _update_identity_states(self, session: Session) -> None:
         """Update chair identity states after each step."""
         params = self.params
@@ -742,7 +829,16 @@ class CouncilEngine:
                 SeatHealth.KILLED,
             }:
                 continue
-            action = self.select_action(session, node, seat_name, profile)
+
+            # Try runtime first for hybrid/local_llm modes
+            action = None
+            if self.runtime and self.runtime_mode in ("local_llm", "hybrid"):
+                action = self._execute_seat_runtime(session, node, seat_name, profile)
+
+            # Fall back to simulation if runtime failed or in simulation mode
+            if action is None:
+                action = self.select_action(session, node, seat_name, profile)
+
             if action:
                 self.apply_action(session, node, action)
 
@@ -1091,7 +1187,7 @@ class CouncilEngine:
                 node,
                 f"Evidence: {action.title or node.title[:30]}",
                 action.summary or f"Evidence needed by {action.seat}",
-                NodeType.EVIDENCE,
+                NodeType.EVIDENCE_NEEDED,
             )
             node.children.append(child.node_id)
 
