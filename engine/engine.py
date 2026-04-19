@@ -42,12 +42,23 @@ class CouncilEngine:
         self,
         seat_profiles: Dict[str, SeatProfile] = None,
         params: SimulationParams = None,
+        runtime_mode: str = "simulation",
     ):
         self.seat_profiles = seat_profiles or SEAT_PROFILES
         self.params = params or SimulationParams()
         validation_errors = self.params.validate()
         if validation_errors:
             raise ValueError(f"Invalid SimulationParams: {validation_errors}")
+
+        # Runtime integration
+        try:
+            from seats.runtime import SeatRuntime
+
+            self.runtime = SeatRuntime(mode=runtime_mode)
+            self.runtime_mode = runtime_mode
+        except ImportError:
+            self.runtime = None
+            self.runtime_mode = "simulation"
 
     def create_session(
         self, topic: str, max_steps: int = 50, mode: ViewMode = ViewMode.COUNCIL
@@ -1043,11 +1054,74 @@ class CouncilEngine:
             node.stance_map[action.seat] = "object"
             session.seat_states[action.seat].objections_made += 1
         elif action.action_type == "claim":
-            node.children.append(action.node_id)
+            # Create real child node
+            child = self._create_child_node(
+                session,
+                node,
+                action.title or action.summary or "New claim",
+                action.summary or f"Claim by {action.seat}",
+                NodeType.CLAIM,
+            )
+            node.children.append(child.node_id)
         elif action.action_type == "refinement":
             node.refinements.append(action.seat)
+            # Also create refinement child
+            child = self._create_child_node(
+                session,
+                node,
+                f"Refinement: {action.title or node.title[:30]}",
+                action.summary or f"Refinement by {action.seat}",
+                NodeType.REFINEMENT,
+            )
+            node.children.append(child.node_id)
         elif action.action_type == "alternative":
             node.alternatives.append(action.seat)
+            # Create alternative child
+            alt = self._create_child_node(
+                session,
+                node,
+                f"Alternative: {action.title or node.title[:30]}",
+                action.summary or f"Alternative by {action.seat}",
+                NodeType.ALTERNATIVE,
+            )
+            node.children.append(alt.node_id)
+        elif action.action_type == "evidence_needed":
+            child = self._create_child_node(
+                session,
+                node,
+                f"Evidence: {action.title or node.title[:30]}",
+                action.summary or f"Evidence needed by {action.seat}",
+                NodeType.EVIDENCE,
+            )
+            node.children.append(child.node_id)
+
+    def _create_child_node(
+        self,
+        session: Session,
+        parent: Node,
+        title: str,
+        summary: str,
+        node_type: NodeType,
+    ) -> Node:
+        """Create a real child node."""
+        child = Node(
+            node_id=session.next_node_id(),
+            node_type=node_type,
+            title=title[:120],
+            summary=summary[:250],
+            parent_id=parent.node_id,
+            created_by=parent.created_by,
+            depth=parent.depth + 1,
+            linked_seats=parent.linked_seats.copy(),
+            confidence=parent.confidence * 0.9,
+            gravity=max(0.15, parent.gravity - 0.05),
+        )
+        session.nodes[child.node_id] = child
+        session.active_queue.append(child.node_id)
+        session.add_event(
+            "node_created", f"{node_type.value}: {title[:50]}", node_id=child.node_id
+        )
+        return child
 
     def update_gravity(self, node: Node) -> None:
         activity = len(node.objections) + len(node.supports) + len(node.refinements)
