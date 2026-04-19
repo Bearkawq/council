@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 """Council GUI - local web interface."""
 
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, jsonify
 from engine.engine import CouncilEngine
 from core.enums import ViewMode, GravityStage
 
 app = Flask(__name__)
-engine = CouncilEngine()
+RUNTIME_MODE = "hybrid"  # simulation, local_llm, hybrid
+engine = CouncilEngine(runtime_mode=RUNTIME_MODE)
 session = None
 selected_branch = None
+seat_telemetry = {}
 
 
 def init_session(topic="Council", mode=ViewMode.COUNCIL):
-    global session, selected_branch
+    global session, selected_branch, seat_telemetry
     session = engine.create_session(topic, mode=mode)
     selected_branch = session.active_queue[0] if session.active_queue else None
+    seat_telemetry = {
+        seat: {"status": "idle", "model": "", "latency": 0, "error": ""}
+        for seat in engine.seat_profiles.keys()
+    }
+
+
+def update_seat_telemetry(
+    seat_id: str, status: str, model: str = "", latency: int = 0, error: str = ""
+):
+    seat_telemetry[seat_id] = {
+        "status": status,
+        "model": model,
+        "latency": latency,
+        "error": error,
+    }
 
 
 HTML = """
@@ -265,6 +282,43 @@ HTML = """
         .seat-state {
             color: var(--text-dim);
             font-size: 0.6rem;
+        }
+        
+        .seat-telemetry {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 3px;
+            margin-top: 4px;
+            font-size: 0.5rem;
+        }
+        
+        .telemetry-status {
+            padding: 1px 4px;
+            border-radius: 2px;
+            font-size: 0.45rem;
+            text-transform: uppercase;
+        }
+        .telemetry-status.idle { background: var(--surface); color: var(--text-dim); }
+        .telemetry-status.running { background: var(--info); color: #fff; }
+        .telemetry-status.success { background: var(--success); color: #000; }
+        .telemetry-status.error { background: var(--danger); color: #fff; }
+        .telemetry-status.fallback { background: var(--warn); color: #000; }
+        
+        .telemetry-model {
+            background: var(--surface);
+            padding: 1px 4px;
+            border-radius: 2px;
+            font-size: 0.45rem;
+        }
+        
+        .telemetry-latency {
+            color: var(--text-dim);
+            font-size: 0.45rem;
+        }
+        
+        .telemetry-error {
+            color: var(--danger);
+            font-size: 0.45rem;
         }
         
         .idea-artifact {
@@ -770,6 +824,7 @@ HTML = """
         <div class="panel" style="grid-column: 3 / -1;">
             <div class="panel-header">
                 <span class="panel-title">Seats</span>
+                <span style="font-size: 0.5rem; color: var(--text-dim);">{{ runtime_mode }} mode</span>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px;">
                 {% for seat_name, state in session.seat_states.items() %}
@@ -777,6 +832,16 @@ HTML = """
                     <div class="seat-name">{{ seat_name }}</div>
                     <div class="seat-state">
                         {{ state.direct_challenges }} chal | {{ state.concessions }} con
+                    </div>
+                    <div class="seat-telemetry">
+                        {% if seat_telemetry.get(seat_name) %}
+                        <span class="telemetry-status {{ seat_telemetry[seat_name].status }}">{{ seat_telemetry[seat_name].status }}</span>
+                        {% if seat_telemetry[seat_name].model %}<span class="telemetry-model">{{ seat_telemetry[seat_name].model }}</span>{% endif %}
+                        {% if seat_telemetry[seat_name].latency %}<span class="telemetry-latency">{{ seat_telemetry[seat_name].latency }}ms</span>{% endif %}
+                        {% if seat_telemetry[seat_name].error %}<span class="telemetry-error">{{ seat_telemetry[seat_name].error }}</span>{% endif %}
+                        {% else %}
+                        <span class="telemetry-status idle">idle</span>
+                        {% endif %}
                     </div>
                 </div>
                 {% endfor %}
@@ -946,6 +1011,8 @@ def index():
         root=root,
         selected_branch=selected_branch,
         inspection=inspection,
+        runtime_mode=RUNTIME_MODE,
+        seat_telemetry=seat_telemetry,
     )
 
 
