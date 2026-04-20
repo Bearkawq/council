@@ -203,6 +203,25 @@ class SeatAction:
 
 
 @dataclass
+class RuntimeMetadata:
+    seat: str
+    node_id: str
+    runtime_mode: str
+    model_used: str
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    failure_class: str = ""
+    failure_reason: str = ""
+    parse_status: str = "success"
+    latency_ms: int = 0
+    action_count: int = 0
+    actions_filtered: int = 0
+    summary: str = ""
+    error:Optional[str] = None
+    proposed_actions: List[Dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
 class ReplayEvent:
     step: int
     event_type: str
@@ -265,6 +284,7 @@ class SimulationParams:
     min_rounds_for_recovery: int = 3
     max_interaction_memory: int = 20
     contradiction_hits_threshold: int = 3
+    max_proposed_actions_per_seat: int = 3
 
     def validate(self) -> List[str]:
         errors = []
@@ -397,6 +417,7 @@ class Session:
     reviews: List[ReviewItem] = field(default_factory=list)
     round_history: List[RoundRecord] = field(default_factory=list)
     open_discussion: Optional[OpenDiscussionState] = None
+    runtime_metadata: List[RuntimeMetadata] = field(default_factory=list)
 
     def next_node_id(self) -> str:
         nid = f"n{self.node_counter}"

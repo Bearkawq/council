@@ -23,6 +23,7 @@ from core.models import (
     SimulationParams,
     Motion,
     RoundRecord,
+    RuntimeMetadata,
     clamp,
     sanitize_seat_state,
 )
@@ -101,13 +102,66 @@ class CouncilEngine:
         )
         resp = self.runtime.execute_seat(seat_name, context, system_prompt)
 
-        status = "error" if resp.error else "success"
+        failure_class = ""
+        failure_reason = ""
+        if resp.timeout:
+            failure_class = "timeout"
+            failure_reason = f"Timeout after {resp.timeout}s" if resp.timeout else "timeout"
+        elif resp.error:
+            if "Connection refused" in resp.error or "unavailable" in resp.error.lower():
+                failure_class = "model_unavailable"
+                failure_reason = resp.error[:40]
+            else:
+                failure_class = "error"
+                failure_reason = resp.error[:40]
+        elif resp.parse_failed:
+            failure_class = "parse_failure"
+            failure_reason = "JSON parse failed"
+        elif resp.empty_output:
+            failure_class = "empty_output"
+            failure_reason = "Empty model output"
+
+        status = "runtime_success" if not failure_class else f"failed:{failure_class}"
+        status_detail = ""
+        if resp.fallback_used:
+            status_detail = "FALLBACK"
+        elif failure_class:
+            status_detail = f"FAILED:{failure_class}"
+        else:
+            status_detail = "SUCCESS"
+
         session.add_event(
             "seat_response",
-            f"[{seat_name}] {resp.stance}: {resp.summary[:80]} | {resp.model_used} {resp.latency_ms}ms [{status}]",
+            f"[{seat_name}] {resp.stance}: {resp.summary[:60] if resp.summary else '(no summary)'} | {resp.model_used or 'sim'} {resp.latency_ms}ms [{status_detail}]",
             seat=seat_name,
             node_id=node.node_id,
         )
+
+        # More explicit parse / runtime outcome labeling
+        if resp.fallback_used:
+            parse_status = "fallback_to_simulation"
+        elif failure_class:
+            parse_status = "failure_no_action"
+        else:
+            parse_status = "success"
+
+        runtime_meta = RuntimeMetadata(
+            seat=seat_name,
+            node_id=node.node_id,
+            runtime_mode=self.runtime_mode,
+            model_used=resp.model_used or "none",
+            fallback_used=resp.fallback_used,
+            fallback_reason=resp.fallback_reason or "",
+            failure_class=failure_class,
+            failure_reason=failure_reason,
+            parse_status=parse_status,
+            latency_ms=resp.latency_ms,
+            action_count=len(resp.proposed_actions) if resp.proposed_actions else 1,
+            summary=resp.summary[:100],
+            error=resp.error,
+            proposed_actions=resp.proposed_actions,
+        )
+        session.runtime_metadata.append(runtime_meta)
 
         if resp.fallback_used:
             session.add_event(
@@ -122,6 +176,9 @@ class CouncilEngine:
                     sim_resp = self.runtime._simulation_response(seat_name, context)
                     sim_resp.fallback_reason = resp.error or "parse_failed"
                     sim_resp.fallback_used = True
+                    runtime_meta.fallback_used = True
+                    runtime_meta.fallback_reason = resp.error or "parse_failed"
+                    runtime_meta.parse_status = "fallback_to_simulation"
                     resp = sim_resp
                 except:
                     return None
@@ -133,36 +190,38 @@ class CouncilEngine:
     def _convert_runtime_response(
         self, seat_name: str, node: Node, resp
     ) -> Optional[SeatAction]:
-        """Convert SeatResponse to SeatAction."""
+        """Convert SeatResponse to SeatAction with full action type mapping."""
         if not resp or not resp.stance:
+            return None
+
+        if resp.stance == "abstain":
             return None
 
         action_type = "support"
         title = f"[{seat_name}] {resp.summary[:50]}"
+        summary = resp.summary[:120]
 
         if resp.stance == "object":
             action_type = "object"
-        elif resp.stance == "abstain":
-            return None
+        elif resp.stance == "neutral":
+            action_type = "support"
 
-        if resp.proposed_actions:
+        if resp.proposed_actions and len(resp.proposed_actions) > 0:
             first_action = resp.proposed_actions[0]
             action_type = first_action.get("action_type", action_type)
             title = first_action.get("title", title)[:80]
-            summary = first_action.get("summary", resp.summary)[:120]
-            # Map to valid action types
-            valid = {
-                "support",
-                "object",
-                "claim",
-                "alternative",
-                "refinement",
-                "evidence_needed",
-            }
-            if action_type not in valid:
-                action_type = "support"
-        else:
-            summary = resp.summary[:120]
+            summary = first_action.get("summary", summary)[:120]
+
+        valid_actions = {
+            "support",
+            "object",
+            "claim",
+            "alternative",
+            "refinement",
+            "evidence_needed",
+        }
+        if action_type not in valid_actions:
+            action_type = "support"
 
         return SeatAction(
             seat=seat_name,
@@ -172,6 +231,105 @@ class CouncilEngine:
             summary=summary,
             confidence=resp.confidence,
         )
+
+    def _convert_proposed_actions(
+        self, session: Session, parent: Node, seat_name: str, resp
+    ) -> List[Node]:
+        """Create nodes from all proposed_actions in runtime response."""
+        created_nodes = []
+
+        if not resp.proposed_actions:
+            return created_nodes
+
+        for action_spec in resp.proposed_actions:
+            action_type = action_spec.get("action_type", "support")
+            title = action_spec.get("title", "")[:120]
+            summary = action_spec.get("summary", "")[:250]
+
+            if not title:
+                continue
+
+            node_type = self._action_type_to_node_type(action_type)
+            if node_type is None:
+                continue
+
+            child = Node(
+                node_id=session.next_node_id(),
+                node_type=node_type,
+                title=title,
+                summary=summary,
+                parent_id=parent.node_id,
+                created_by=seat_name,
+                depth=parent.depth + 1,
+                linked_seats=parent.linked_seats.copy(),
+                confidence=parent.confidence * 0.9,
+                gravity=max(0.15, parent.gravity - 0.05),
+            )
+            session.nodes[child.node_id] = child
+            session.active_queue.append(child.node_id)
+            created_nodes.append(child)
+
+        return created_nodes
+
+    def _action_type_to_node_type(self, action_type: str) -> Optional[NodeType]:
+        """Map action_type string to NodeType enum."""
+        mapping = {
+            "claim": NodeType.CLAIM,
+            "alternative": NodeType.ALTERNATIVE,
+            "refinement": NodeType.REFINEMENT,
+            "evidence_needed": NodeType.EVIDENCE_NEEDED,
+            "resolution": NodeType.RESOLUTION,
+        }
+        return mapping.get(action_type)
+
+    def _is_quality_action(
+        self, action_spec: Dict[str, str], parent: Node, siblings: List[Node] = None
+    ) -> bool:
+        """Filter proposed actions - reject low-quality duplicates."""
+        title = action_spec.get("title", "").strip()
+        summary = action_spec.get("summary", "").strip()
+
+        if not title or len(title) < 5:
+            return False
+
+        parent_title = parent.title.lower().strip()
+        title_lower = title.lower()
+
+        if title_lower == parent_title:
+            return False
+
+        if title_lower.startswith(parent_title[:20]) and len(summary) < 10:
+            return False
+
+        if not summary or len(summary) < 8:
+            return False
+
+        stop_phrases = [
+            "same as",
+            "similar to",
+            "like the",
+            "as mentioned",
+            "discussed above",
+            "restating",
+            "reiterating",
+            "to be determined",
+            "tbd",
+            "more research needed",
+            "needs further study",
+        ]
+        for phrase in stop_phrases:
+            if phrase in title_lower or phrase in summary.lower():
+                return False
+
+        if siblings:
+            for sibling in siblings:
+                sibling_title = sibling.title.lower().strip()
+                if title_lower == sibling_title:
+                    return False
+                if len(sibling_title) > 10 and title_lower.startswith(sibling_title[:25]):
+                    return False
+
+        return True
 
     def _update_identity_states(self, session: Session) -> None:
         """Update chair identity states after each step."""
@@ -272,6 +430,14 @@ class CouncilEngine:
         self.run_identity_audit(session)
         self._emit_round_record(session)
         return self.build_artifact(session)
+
+    def continue_deliberation(self, session: Session, steps: int = 1) -> SessionArtifact:
+        """Continue deliberation for specified steps."""
+        original_max = session.max_steps
+        session.max_steps = session.step_count + steps
+        result = self.run(session)
+        session.max_steps = original_max
+        return result
 
     def _emit_round_record(self, session: Session) -> None:
         """Emit round record at end of simulation."""
@@ -823,6 +989,8 @@ class CouncilEngine:
         )
 
     def process_node(self, session: Session, node: Node) -> None:
+        runtime_backed_count = 0
+
         for seat_name, profile in self.seat_profiles.items():
             if session.seat_states[seat_name].health in {
                 SeatHealth.SUSPENDED,
@@ -830,17 +998,115 @@ class CouncilEngine:
             }:
                 continue
 
-            # Try runtime first for hybrid/local_llm modes
             action = None
+            runtime_resp = None
+
             if self.runtime and self.runtime_mode in ("local_llm", "hybrid"):
                 action = self._execute_seat_runtime(session, node, seat_name, profile)
+                if action is not None:
+                    runtime_resp = True
 
-            # Fall back to simulation if runtime failed or in simulation mode
             if action is None:
                 action = self.select_action(session, node, seat_name, profile)
+            else:
+                runtime_backed_count += 1
+                session.add_event(
+                    "runtime_action",
+                    f"[{seat_name}] Runtime-backed: {action.action_type}",
+                    seat=seat_name,
+                    node_id=node.node_id,
+                )
 
             if action:
+                # If this is a runtime-backed primary action, filter duplicates pre-apply
+                if runtime_resp and action.title and action.title.lower() in session.seen_action_hashes:
+                    session.add_event(
+                        "filtered_action",
+                        f"Filtered duplicate primary action: {action.title}",
+                        seat=seat_name,
+                        node_id=node.node_id,
+                    )
+                    # update last runtime metadata if present
+                    if session.runtime_metadata:
+                        try:
+                            session.runtime_metadata[-1].actions_filtered += 1
+                        except Exception:
+                            pass
+                    # skip applying duplicate primary action
+                    continue
+
                 self.apply_action(session, node, action)
+
+                # record first runtime-backed action title to avoid duplicates
+                if runtime_resp:
+                    try:
+                        session.seen_action_hashes.add(action.title.lower())
+                    except Exception:
+                        pass
+
+                if runtime_resp and self.runtime:
+                    last_meta = (
+                        session.runtime_metadata[-1]
+                        if session.runtime_metadata else None
+                    )
+                    if last_meta and last_meta.action_count > 1:
+                        max_actions = getattr(self.params, 'max_proposed_actions_per_seat', 3)
+                        actions_to_apply = last_meta.proposed_actions[:max_actions]
+                        actions_filtered = 0
+                        actions_created = 0
+                        sibling_nodes = [
+                            session.nodes[cid]
+                            for cid in node.children
+                            if cid in session.nodes
+                        ]
+                        for action_spec in actions_to_apply[1:]:
+                            if not self._is_quality_action(action_spec, node, sibling_nodes):
+                                actions_filtered += 1
+                                continue
+
+                            title = action_spec.get("title", "").strip()
+                            summary = action_spec.get("summary", "")
+
+                            if not title:
+                                actions_filtered += 1
+                                continue
+
+                            key = title.lower()
+                            if key in session.seen_action_hashes:
+                                actions_filtered += 1
+                                continue
+
+                            action_type = action_spec.get("action_type", "support")
+                            node_type = self._action_type_to_node_type(action_type)
+                            if node_type is None:
+                                actions_filtered += 1
+                                continue
+
+                            # create child node
+                            child = Node(
+                                node_id=session.next_node_id(),
+                                node_type=node_type,
+                                title=title[:120],
+                                summary=summary[:250],
+                                parent_id=node.node_id,
+                                created_by=seat_name,
+                                depth=node.depth + 1,
+                                linked_seats=node.linked_seats.copy(),
+                                confidence=node.confidence * 0.9,
+                                gravity=max(0.15, node.gravity - 0.05),
+                            )
+                            session.nodes[child.node_id] = child
+                            session.active_queue.append(child.node_id)
+                            node.children.append(child.node_id)
+
+                            # mark seen
+                            session.seen_action_hashes.add(key)
+                            actions_created += 1
+
+                        if last_meta:
+                            last_meta.actions_filtered = actions_filtered
+                            # reflect created/filtered counts
+                            last_meta.action_count = (1 + actions_created)
 
         self.update_gravity(node)
 

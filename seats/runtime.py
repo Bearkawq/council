@@ -50,7 +50,7 @@ DEFAULT_SEAT_CONFIGS = {
         "Researcher", "Researcher", "granite3.3:2b", 0.5, tier="hot"
     ),
     "Operator": SeatConfig("Operator", "Operator", "mistral:latest", 0.75, tier="hot"),
-    "Skeptic": SeatConfig("Skeptic", "Skeptic", "phi4-mini", 0.6, tier="hot"),
+    "Skeptic": SeatConfig("Skeptic", "Skeptic", "phi4-mini:latest", 0.6, tier="hot"),
     "Cold1": SeatConfig("Cold1", "Cold", "olmo2:7b", 0.5, tier="cold"),
     "Cold2": SeatConfig("Cold2", "Cold", "qwen3:14b", 0.5, tier="cold"),
 }
@@ -121,29 +121,55 @@ class SeatRuntime:
                 return sim
 
     def _extract_json(self, output: str) -> Optional[dict]:
-        """Extract and parse JSON from output."""
+        """Robustly extract JSON-like object from output and attempt to fix common errors.
+
+        Attempts:
+        - strip markdown fences
+        - find first {..} block
+        - fix trailing commas
+        - replace single quotes with double quotes as a last resort
+        - return None if parsing fails
+        """
         if not output or not output.strip():
             return None
 
-        # Try direct parse first
-        output = output.strip()
+        out = output.strip()
 
-        # Remove markdown code blocks
-        if "```json" in output:
-            output = output.split("```json")[1].split("```")[0]
-        elif "```" in output:
-            output = output.split("```")[1].split("```")[0]
+        # Strip markdown fences if present
+        if "```json" in out:
+            out = out.split("```json", 1)[1].split("```", 1)[0]
+        elif "```" in out:
+            out = out.split("```", 1)[1].split("```", 1)[0]
 
-        # Find JSON bounds
-        if "{" in output:
-            start = output.find("{")
-            end = output.rfind("}")
+        # Try to find the first JSON object bounds
+        if "{" in out and "}" in out:
+            start = out.find("{")
+            end = out.rfind("}")
             if end > start:
-                output = output[start : end + 1]
+                candidate = out[start : end + 1]
+            else:
+                candidate = out
+        else:
+            candidate = out
 
+        # Try direct parse
         try:
-            return json.loads(output)
-        except json.JSONDecodeError:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+        # Try to remove trailing commas in objects/arrays
+        fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
+        try:
+            return json.loads(fixed)
+        except Exception:
+            pass
+
+        # As a last resort, naively convert single quotes to double quotes
+        naive = candidate.replace("'", '"')
+        try:
+            return json.loads(naive)
+        except Exception:
             return None
 
     def _llm_response(
@@ -151,9 +177,9 @@ class SeatRuntime:
         cfg: SeatConfig,
         node_context: str,
         system_prompt: str,
-        retry: bool = False,
+        retry: int = 0,
     ) -> SeatResponse:
-        """Call local LLM."""
+        """Call local LLM with more robust retry and parsing strategies."""
         start = time.time()
 
         prompt = f"{system_prompt}\n\nNode Context:\n{node_context}\n\nRespond with JSON only."
@@ -170,7 +196,7 @@ class SeatRuntime:
                         "num_predict": cfg.max_tokens,
                     },
                 },
-                timeout=cfg.timeout,
+                timeout=cfg.timeout if retry == 0 else min(cfg.timeout * 2, 120),
             )
             latency = int((time.time() - start) * 1000)
 
@@ -179,8 +205,12 @@ class SeatRuntime:
 
             output = r.json().get("response", "")
 
-            # Check empty output
+            # Check empty output and attempt one gentle nudge
             if not output or not output.strip():
+                if retry < 2:
+                    # gentle nudge to encourage JSON output
+                    corrective = f"{system_prompt}\n\nNode Context:\n{node_context}\n\nThe previous answer was empty. Please respond only with JSON that conforms to the schema."
+                    return self._llm_response(cfg, node_context, corrective, retry=retry + 1)
                 return SeatResponse(
                     seat=cfg.seat_id,
                     node_id="",
@@ -193,12 +223,33 @@ class SeatRuntime:
 
             # Try to parse JSON
             data = self._extract_json(output)
-            if data is None and not retry:
-                # Retry once with corrective prompt
-                corrective = f'Previous output was not valid JSON. Output: {output[:200]}. Respond ONLY with: {{"seat": "{cfg.seat_id}", "node_id": "auto", "stance": "neutral", "summary": "...", "confidence": 0.5}}'
-                return self._llm_response(cfg, node_context, corrective, retry=True)
+            if data is None and retry < 2:
+                # Retry with corrective, progressively stricter prompts
+                if retry == 0:
+                    corrective = (
+                        system_prompt
+                        + "\n\nPrevious output was not valid JSON. Respond ONLY with a single JSON object exactly matching the required schema. No explanation."
+                    )
+                else:
+                    corrective = (
+                        f"Respond ONLY with this exact small schema: {{\"seat\": \"{cfg.seat_id}\", \"node_id\": \"auto\", \"stance\": \"neutral\", \"summary\": \"short\", \"confidence\": 0.5}}"
+                    )
+                return self._llm_response(cfg, node_context, corrective, retry=retry + 1)
 
             if data is None:
+                # Attempt to parse freeform proposed actions from text
+                proposed = self._parse_freeform_actions(output)
+                if proposed:
+                    return SeatResponse(
+                        seat=cfg.seat_id,
+                        node_id="",
+                        stance="neutral",
+                        summary=output[:200],
+                        proposed_actions=proposed,
+                        model_used=cfg.model,
+                        latency_ms=latency,
+                    )
+
                 return SeatResponse(
                     seat=cfg.seat_id,
                     node_id="",
@@ -226,6 +277,9 @@ class SeatRuntime:
             )
 
         except requests.exceptions.Timeout:
+            if retry < 1:
+                # one quick retry with larger timeout
+                return self._llm_response(cfg, node_context, system_prompt, retry=retry + 1)
             return SeatResponse(
                 seat=cfg.seat_id,
                 node_id="",
@@ -286,6 +340,29 @@ class SeatRuntime:
             confidence=conf,
             fallback_used=fallback,
         )
+
+    def _parse_freeform_actions(self, output: str) -> List[Dict[str, str]]:
+        """Attempt to extract proposed actions from freeform text when JSON parsing fails.
+
+        Looks for lines like:
+        - claim: Title - summary
+        - 1) claim: Title - summary
+        """
+        lines = output.splitlines()
+        actions = []
+        for ln in lines:
+            m = re.search(r"(?:-|\d+\))\s*(claim|alternative|refinement|support|object|evidence_needed)\s*[:\-]\s*(.+)", ln, re.IGNORECASE)
+            if m:
+                a_type = m.group(1).lower()
+                rest = m.group(2).strip()
+                if " - " in rest:
+                    title, summary = rest.split(" - ", 1)
+                else:
+                    parts = rest.split(". ", 1)
+                    title = parts[0]
+                    summary = parts[1] if len(parts) > 1 else ""
+                actions.append({"action_type": a_type, "title": title.strip(), "summary": summary.strip()})
+        return actions
 
     def get_telemetry(self) -> Dict[str, Any]:
         """Get runtime telemetry."""

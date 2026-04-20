@@ -24,13 +24,18 @@ def init_session(topic="Council", mode=ViewMode.COUNCIL):
 
 
 def update_seat_telemetry(
-    seat_id: str, status: str, model: str = "", latency: int = 0, error: str = ""
+    seat_id: str, status: str, model: str = "", latency: int = 0, error: str = "",
+    fallback_used: bool = False, fallback_reason: str = "", failure_class: str = "", action_count: int = 0
 ):
     seat_telemetry[seat_id] = {
         "status": status,
         "model": model,
         "latency": latency,
         "error": error,
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
+        "failure_class": failure_class,
+        "action_count": action_count,
     }
 
 
@@ -838,7 +843,9 @@ HTML = """
                         <span class="telemetry-status {{ seat_telemetry[seat_name].status }}">{{ seat_telemetry[seat_name].status }}</span>
                         {% if seat_telemetry[seat_name].model %}<span class="telemetry-model">{{ seat_telemetry[seat_name].model }}</span>{% endif %}
                         {% if seat_telemetry[seat_name].latency %}<span class="telemetry-latency">{{ seat_telemetry[seat_name].latency }}ms</span>{% endif %}
-                        {% if seat_telemetry[seat_name].error %}<span class="telemetry-error">{{ seat_telemetry[seat_name].error }}</span>{% endif %}
+                        {% if seat_telemetry[seat_name].get('fallback_used') %}<span class="telemetry-fallback">FALLBACK</span>{% endif %}
+                        {% if seat_telemetry[seat_name].get('failure_class') %}<span class="telemetry-error">{{ seat_telemetry[seat_name].failure_class }}</span>{% endif %}
+                        {% if seat_telemetry[seat_name].get('action_count', 0) > 1 %}<span class="telemetry-actions">{{ seat_telemetry[seat_name].action_count }}acts</span>{% endif %}
                         {% else %}
                         <span class="telemetry-status idle">idle</span>
                         {% endif %}
